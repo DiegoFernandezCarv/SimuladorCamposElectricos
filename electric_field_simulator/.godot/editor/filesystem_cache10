@@ -1,0 +1,14 @@
+78098b89c88a74ebe8c20117b8754620
+::res://::1788743046
+README.md::TextFile::-1::1788743003::0::1::::<><><>0<>0<><>::
+::res://scenes/::1788743003
+Main.tscn::PackedScene::-1::1788743003::0::1::::<><><>0<>0<><>::res://scripts/main.gd
+::res://scripts/::1788743003
+main.gd::GDScript::2004543019087765930::1788743003::0::1::::<>Node2D<><>0<>0<><>::
+::res://scripts/physics/::1788743003
+charge.gd::GDScript::2338496988735576059::1788743003::0::1::::Charge<>RefCounted<><>0<>0<><>::
+constants.gd::GDScript::5102288960412376329::1788743003::0::1::::PhysicsConstants<>RefCounted<><>0<>0<><>::
+electric_field.gd::GDScript::4451342102935461088::1788743003::0::1::::ElectricFieldEngine<>RefCounted<><>0<>0<><>::
+::res://tests/::1788743003
+TestRunner.tscn::PackedScene::-1::1788743003::0::1::::<><><>0<>0<><>::res://tests/test_field.gd
+test_field.gd::GDScript::8804611283426061165::1788743003::0::1::::<>Node<><>0<>0<><>::
