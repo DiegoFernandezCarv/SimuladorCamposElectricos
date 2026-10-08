@@ -28,15 +28,27 @@ var mouse_world_pos: Vector2 = Vector2.ZERO
 var next_charge_uC: float = 1.0      # magnitud (µC) para la próxima carga a colocar
 var selected_charge: Charge = null   # carga actualmente seleccionada (o null)
 var dragging: bool = false
+var field_lines: Array = []
 
 func _ready() -> void:
 	# Dipolo de ejemplo para empezar a experimentar (sección 52, Experimento 2)
 	charges.append(Charge.new(Vector2(-2, 0), PhysicsConstants.MICRO))
 	charges.append(Charge.new(Vector2(2, 0), -PhysicsConstants.MICRO))
+	_recompute_field_lines()
 
 	charge_value_input.text = "%.2f" % next_charge_uC
 	charge_value_input.text_changed.connect(_on_charge_value_changed)
 	charge_value_input.text_submitted.connect(_on_charge_value_submitted)
+
+## Recalcula las líneas de campo. NO se llama cada frame por rendimiento
+## (trazar 16 líneas × N cargas × hasta 800 pasos en cada _process sería
+## costoso); solo cuando el usuario suelta el drag o cambia algo.
+func _recompute_field_lines() -> void:
+	var margin: float = 1.0  # metros de margen fuera de pantalla
+	var top_left: Vector2 = screen_to_world(Vector2.ZERO) - Vector2(margin, margin)
+	var bottom_right: Vector2 = screen_to_world(get_viewport_rect().size) + Vector2(margin, margin)
+	var bounds: Rect2 = Rect2(top_left, bottom_right - top_left).abs()
+	field_lines = FieldLineGenerator.generate_field_lines(charges, bounds)
 
 func _process(_delta: float) -> void:
 	mouse_world_pos = screen_to_world(get_local_mouse_position())
@@ -67,6 +79,7 @@ func _on_charge_value_changed(new_text: String) -> void:
 
 func _on_charge_value_submitted(_new_text: String) -> void:
 	charge_value_input.release_focus()
+	_recompute_field_lines()
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseButton:
@@ -94,7 +107,8 @@ func _unhandled_input(event: InputEvent) -> void:
 		else:
 			if event.button_index == MOUSE_BUTTON_LEFT:
 				dragging = false
-
+				if selected_charge != null:
+					_recompute_field_lines()
 	elif event is InputEventScreenTouch and event.pressed:
 		# Soporte táctil básico para Android (sección 29): un toque = carga positiva
 		var world_pos: Vector2 = screen_to_world(event.position)
@@ -150,6 +164,7 @@ func screen_to_world(screen_pos: Vector2) -> Vector2:
 
 # ---------- Dibujo ----------
 func _draw() -> void:
+	_draw_field_lines()
 	_draw_field_grid()
 	_draw_charges()
 	_draw_info_panel()
@@ -228,6 +243,16 @@ func _draw_info_panel() -> void:
 	for i in range(lines.size()):
 		var y_pos: float = 28.0 + i * LINE_HEIGHT_PX
 		draw_string(ThemeDB.fallback_font, Vector2(20, y_pos), lines[i], HORIZONTAL_ALIGNMENT_LEFT, -1, 16)
+ 
+## Dibuja las líneas de campo pre-calculadas (sección 11)
+func _draw_field_lines() -> void:
+	var color: Color = Color(1.0, 0.85, 0.2, 0.55)
+	for line in field_lines:
+		var screen_points: PackedVector2Array = PackedVector2Array()
+		for world_point in line:
+			screen_points.append(world_to_screen(world_point))
+		if screen_points.size() > 1:
+			draw_polyline(screen_points, color, 1.5, true)
 
 ## Formatea el valor de una carga en µC con signo explícito, ej: "+1.50 µC"
 func _format_charge_label(value_uC: float) -> String:
