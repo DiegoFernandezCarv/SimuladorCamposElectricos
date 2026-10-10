@@ -1,6 +1,5 @@
 res://scenes/Main.tscn
-res://scripts/physics/charge_stats.gd
-res://scripts/physics/electric_field.gd
 res://scripts/main.gd
+res://scripts/physics/field_lines.gd
+res://scripts/physics/charge_stats.gd
 res://tests/test_stats.gd
-res://tests/test_field.gd
