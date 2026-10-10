@@ -21,6 +21,11 @@ func _ready() -> void:
 	test_equal_charges_center()
 	test_opposite_charges_center()
 	test_superposition()
+
+	print("\n=== ESTADÍSTICAS DE CARGA ===")
+	var stats_ok: bool = TestChargeStats.run_all()
+	_check("TestChargeStats (4 pruebas)", stats_ok)
+
 	print("\n=== RESULTADO: %d aprobadas, %d fallidas ===" % [passed, failed])
 
 func _check(test_name: String, condition: bool, detail: String = "") -> void:
