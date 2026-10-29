@@ -49,3 +49,23 @@ static func translate(shape: Array, delta: Vector2) -> void:
 static func rotate_about(shape: Array, pivot: Vector2, angle_rad: float) -> void:
 	for c in shape:
 		c.position = pivot + (c.position - pivot).rotated(angle_rad)
+
+## Redimensiona un anillo uniformemente manteniendo su centro y redistribuyendo sus cargas.
+static func resize_ring(group: Dictionary, new_radius: float) -> void:
+	if not group.has("points") or group["points"].is_empty():
+		return
+	new_radius = clampf(new_radius, 0.2, 20.0)
+	var pts: Array = group["points"]
+	var count: int = pts.size()
+	var center: Vector2 = group.get("center", Vector2.ZERO)
+	if not group.has("center"):
+		var sum: Vector2 = Vector2.ZERO
+		for p in pts:
+			sum += p.position
+		center = sum / float(count)
+		group["center"] = center
+
+	group["radius"] = new_radius
+	for i in range(count):
+		var a: float = TAU * float(i) / float(count)
+		pts[i].position = center + Vector2(cos(a), sin(a)) * new_radius

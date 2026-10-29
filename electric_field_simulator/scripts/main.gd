@@ -60,7 +60,7 @@ extends Node2D
 ##                          hacen las demás; varias: carga total, fuerza externa,
 ##                          comprobación de la 3ª ley y energías).
 
-enum Mode { PLACE, SELECT }
+enum Mode { PLACE, SELECT, PAN }
 enum Layer { ELECTRIC, MAGNETIC }
 
 const DEFAULT_PIXELS_PER_METER: float = 80.0
@@ -79,11 +79,11 @@ const SELECT_RADIUS_PX: float = 18.0
 const PANEL_MARGIN_PX: float = 10.0
 const PANEL_PADDING_PX: float = 10.0
 const PANEL_FONT_SIZE: int = 16
-const LEFT_PANEL_WIDTH: float = 330.0
-const OBJECT_MENU_Y: float = 298.0          # el panel izquierdo termina donde termina el menú de objetos
+const TOP_BAR_HEIGHT: float = 54.0          # alto de la cinta superior estilo Word
+const TOUCH_BUTTON_HEIGHT: float = 40.0     # tamaño accesible para botones táctiles
 const SHAPE_POINTS: int = 16                # cargas puntuales por varilla o anillo
 const SCROLLBAR_PX: float = 14.0            # grosor de las barras de desplazamiento
-const H_SCROLL_AT_TOP: bool = true          # true: barra horizontal arriba; false: abajo (como Word)
+const H_SCROLL_AT_TOP: bool = false         # barra horizontal abajo (como Word y Excel)
 const SCROLL_EXTENT_M: float = 40.0         # el mundo desplazable mide al menos ±40 m
 const SCROLL_MARGIN_M: float = 5.0          # margen alrededor del contenido
 const SHAPE_LENGTH_M: float = 2.0
@@ -135,9 +135,30 @@ var box_additive: bool = false
 
 var field_lines: Array = []          # caché de líneas de campo (se recalcula solo cuando hace falta)
 var magnetic_lines: Array = []       # caché de líneas de campo magnético (solo se calcula en la capa magnética)
+
+# Optimización de la cuadrícula de flechas (caché de geometría)
+var grid_dirty: bool = true
+var cached_arrows: Array = []
+var cached_mag_arrows: Array = []
+var last_grid_step: int = GRID_STEP_PX
+
+# Barra superior estilo cinta (Word Ribbon)
+var top_bar: PanelContainer
+var top_scroll: ScrollContainer
+var ribbon_hbox: HBoxContainer
+var object_menu_btn: Button
+var object_menu_container: PanelContainer
+
+var place_sign: float = 1.0                     # +1.0 o -1.0 para colocar cargas con un toque en móvil
 var deselect_button: Button
+var delete_button: Button
 var mode_button: Button
+var sign_button: Button
 var layer_button: Button
+var verify_button: Button
+var ring_minus_button: Button
+var ring_plus_button: Button
+var experiment_button: Button
 var object_menu: ObjectMenu
 var h_scroll: HScrollBar
 var v_scroll: VScrollBar
@@ -145,6 +166,23 @@ var scroll_rect: Rect2 = Rect2(-40.0, -40.0, 80.0, 80.0)   # mundo que cubren la
 var syncing_scroll: bool = false                           # evita que fijar las barras mueva la cámara
 var rotate_ccw_button: Button
 var rotate_cw_button: Button
+
+# Panel de verificación para calculadora
+var verification_panel: PanelContainer
+var verification_text_edit: TextEdit
+
+# Gestor Académico de Experimentos (JSON / Portapapeles / Archivos)
+var experiment_dialog: PanelContainer
+var export_json_text: TextEdit
+var import_json_text: TextEdit
+var import_status_label: Label
+var save_file_dialog: FileDialog
+var load_file_dialog: FileDialog
+
+# Soporte multitáctil para pellizco (zoom) y arrastre con dos dedos en móvil
+var touch_fingers: Dictionary = {}
+var initial_pinch_dist: float = 0.0
+var initial_pinch_zoom: float = DEFAULT_PIXELS_PER_METER
 
 # Objetos rígidos (por ahora imanes). Su campo magnético se dibujará en el siguiente paso.
 var rigid_objects: Array = []        # Array de RigidObject
@@ -183,29 +221,160 @@ func _ready() -> void:
 	charges.append(Charge.new(Vector2(2, 0), -PhysicsConstants.MICRO))
 	_recompute_field_lines()
 
-	charge_value_input.text_changed.connect(_on_charge_value_changed)
-	charge_value_input.text_submitted.connect(_on_charge_value_submitted)
+	if not charge_value_input.text_changed.is_connected(_on_charge_value_changed):
+		charge_value_input.text_changed.connect(_on_charge_value_changed)
+	if not charge_value_input.text_submitted.is_connected(_on_charge_value_submitted):
+		charge_value_input.text_submitted.connect(_on_charge_value_submitted)
 
-	# FOCUS_NONE: así Espacio y las flechas no "activan" los botones por accidente
+	# Cinta superior horizontal estilo Word (Ribbon)
+	top_bar = PanelContainer.new()
+	var ribbon_style: StyleBoxFlat = StyleBoxFlat.new()
+	ribbon_style.bg_color = Color(0.09, 0.11, 0.16, 0.96)
+	ribbon_style.border_width_bottom = 2
+	ribbon_style.border_color = Color(0.24, 0.35, 0.52, 0.8)
+	ribbon_style.content_margin_top = 4
+	ribbon_style.content_margin_bottom = 4
+	ribbon_style.content_margin_left = 8
+	ribbon_style.content_margin_right = 8
+	top_bar.custom_minimum_size = Vector2(0.0, TOP_BAR_HEIGHT)
+	top_bar.add_theme_stylebox_override("panel", ribbon_style)
+	$UI.add_child(top_bar)
+
+	top_scroll = ScrollContainer.new()
+	top_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
+	top_scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	top_scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	top_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	top_bar.add_child(top_scroll)
+
+	ribbon_hbox = HBoxContainer.new()
+	ribbon_hbox.add_theme_constant_override("separation", 8)
+	ribbon_hbox.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	top_scroll.add_child(ribbon_hbox)
+
+	experiment_button = Button.new()
+	experiment_button.text = "🎓 Experimentos (JSON)"
+	experiment_button.focus_mode = Control.FOCUS_NONE
+	experiment_button.custom_minimum_size = Vector2(0.0, TOUCH_BUTTON_HEIGHT)
+	experiment_button.pressed.connect(_toggle_experiment_dialog)
+	ribbon_hbox.add_child(experiment_button)
+
+	object_menu_btn = Button.new()
+	object_menu_btn.text = "📦 Objetos [▼]"
+	object_menu_btn.focus_mode = Control.FOCUS_NONE
+	object_menu_btn.custom_minimum_size = Vector2(0.0, TOUCH_BUTTON_HEIGHT)
+	object_menu_btn.pressed.connect(_toggle_object_menu)
+	ribbon_hbox.add_child(object_menu_btn)
+
+	ribbon_hbox.add_child(_create_ribbon_separator())
+
 	mode_button = Button.new()
 	mode_button.focus_mode = Control.FOCUS_NONE
+	mode_button.custom_minimum_size = Vector2(0.0, TOUCH_BUTTON_HEIGHT)
 	mode_button.pressed.connect(_toggle_mode)
-	$UI.add_child(mode_button)
+	ribbon_hbox.add_child(mode_button)
 
-	deselect_button = Button.new()
-	deselect_button.text = "Deseleccionar (Esc)"
-	deselect_button.focus_mode = Control.FOCUS_NONE
-	deselect_button.pressed.connect(_on_deselect_pressed)
-	$UI.add_child(deselect_button)
+	ribbon_hbox.add_child(_create_ribbon_separator())
+
+	charge_value_label.owner = null
+	charge_value_label.reparent(ribbon_hbox)
+	charge_value_label.text = "q:"
+	charge_value_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+
+	charge_value_input.owner = null
+	charge_value_input.reparent(ribbon_hbox)
+	charge_value_input.custom_minimum_size = Vector2(75.0, TOUCH_BUTTON_HEIGHT)
+	charge_value_input.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+
+	sign_button = Button.new()
+	sign_button.focus_mode = Control.FOCUS_NONE
+	sign_button.custom_minimum_size = Vector2(0.0, TOUCH_BUTTON_HEIGHT)
+	sign_button.pressed.connect(_toggle_place_sign)
+	ribbon_hbox.add_child(sign_button)
+	_update_sign_button()
+
+	ribbon_hbox.add_child(_create_ribbon_separator())
 
 	layer_button = Button.new()
 	layer_button.focus_mode = Control.FOCUS_NONE
+	layer_button.custom_minimum_size = Vector2(0.0, TOUCH_BUTTON_HEIGHT)
 	layer_button.pressed.connect(_toggle_layer)
-	$UI.add_child(layer_button)
+	ribbon_hbox.add_child(layer_button)
+
+	ribbon_hbox.add_child(_create_ribbon_separator())
+
+	delete_button = Button.new()
+	delete_button.text = "🗑️ Borrar"
+	delete_button.focus_mode = Control.FOCUS_NONE
+	delete_button.custom_minimum_size = Vector2(0.0, TOUCH_BUTTON_HEIGHT)
+	delete_button.pressed.connect(_on_delete_pressed)
+	ribbon_hbox.add_child(delete_button)
+
+	deselect_button = Button.new()
+	deselect_button.text = "✕ Deseleccionar"
+	deselect_button.focus_mode = Control.FOCUS_NONE
+	deselect_button.custom_minimum_size = Vector2(0.0, TOUCH_BUTTON_HEIGHT)
+	deselect_button.pressed.connect(_on_deselect_pressed)
+	ribbon_hbox.add_child(deselect_button)
+
+	rotate_ccw_button = Button.new()
+	rotate_ccw_button.text = "↺ -15° (Q)"
+	rotate_ccw_button.focus_mode = Control.FOCUS_NONE
+	rotate_ccw_button.custom_minimum_size = Vector2(0.0, TOUCH_BUTTON_HEIGHT)
+	rotate_ccw_button.pressed.connect(_rotate_selected.bind(-ROTATE_STEP_DEG))
+	ribbon_hbox.add_child(rotate_ccw_button)
+
+	rotate_cw_button = Button.new()
+	rotate_cw_button.text = "↻ +15° (E)"
+	rotate_cw_button.focus_mode = Control.FOCUS_NONE
+	rotate_cw_button.custom_minimum_size = Vector2(0.0, TOUCH_BUTTON_HEIGHT)
+	rotate_cw_button.pressed.connect(_rotate_selected.bind(ROTATE_STEP_DEG))
+	ribbon_hbox.add_child(rotate_cw_button)
+
+	ring_minus_button = Button.new()
+	ring_minus_button.text = "🔘 Anillo −"
+	ring_minus_button.focus_mode = Control.FOCUS_NONE
+	ring_minus_button.custom_minimum_size = Vector2(0.0, TOUCH_BUTTON_HEIGHT)
+	ring_minus_button.pressed.connect(func(): _resize_selected_ring(-0.2))
+	ribbon_hbox.add_child(ring_minus_button)
+
+	ring_plus_button = Button.new()
+	ring_plus_button.text = "🔘 Anillo +"
+	ring_plus_button.focus_mode = Control.FOCUS_NONE
+	ring_plus_button.custom_minimum_size = Vector2(0.0, TOUCH_BUTTON_HEIGHT)
+	ring_plus_button.pressed.connect(func(): _resize_selected_ring(0.2))
+	ribbon_hbox.add_child(ring_plus_button)
+
+	ribbon_hbox.add_child(_create_ribbon_separator())
+
+	verify_button = Button.new()
+	verify_button.text = "🔬 Verificación (V)"
+	verify_button.focus_mode = Control.FOCUS_NONE
+	verify_button.custom_minimum_size = Vector2(0.0, TOUCH_BUTTON_HEIGHT)
+	verify_button.pressed.connect(_toggle_verification)
+	ribbon_hbox.add_child(verify_button)
+
+	# Desplegable flotante de Objetos
+	object_menu_container = PanelContainer.new()
+	object_menu_container.visible = false
+	var obj_style: StyleBoxFlat = StyleBoxFlat.new()
+	obj_style.bg_color = Color(0.08, 0.10, 0.15, 0.98)
+	obj_style.border_width_left = 1
+	obj_style.border_width_right = 1
+	obj_style.border_width_bottom = 2
+	obj_style.border_color = Color(0.3, 0.5, 0.8, 0.8)
+	obj_style.corner_radius_bottom_left = 6
+	obj_style.corner_radius_bottom_right = 6
+	obj_style.content_margin_left = 6
+	obj_style.content_margin_right = 6
+	obj_style.content_margin_top = 6
+	obj_style.content_margin_bottom = 6
+	object_menu_container.add_theme_stylebox_override("panel", obj_style)
 
 	object_menu = ObjectMenu.new()
 	object_menu.object_requested.connect(_on_object_requested)
-	$UI.add_child(object_menu)
+	object_menu_container.add_child(object_menu)
+	$UI.add_child(object_menu_container)
 
 	h_scroll = HScrollBar.new()
 	h_scroll.step = 0.0
@@ -219,25 +388,18 @@ func _ready() -> void:
 	v_scroll.value_changed.connect(_on_v_scroll)
 	$UI.add_child(v_scroll)
 
-	rotate_ccw_button = Button.new()
-	rotate_ccw_button.text = "Rotar +%d° (Q)" % int(ROTATE_STEP_DEG)
-	rotate_ccw_button.focus_mode = Control.FOCUS_NONE
-	rotate_ccw_button.pressed.connect(_rotate_selected.bind(ROTATE_STEP_DEG))
-	$UI.add_child(rotate_ccw_button)
-
-	rotate_cw_button = Button.new()
-	rotate_cw_button.text = "Rotar -%d° (E)" % int(ROTATE_STEP_DEG)
-	rotate_cw_button.focus_mode = Control.FOCUS_NONE
-	rotate_cw_button.pressed.connect(_rotate_selected.bind(-ROTATE_STEP_DEG))
-	$UI.add_child(rotate_cw_button)
-
-	_layout_left_panel()
+	_setup_verification_ui()
+	_setup_experiment_dialog()
+	_setup_file_dialogs()
+	_layout_top_bar()
 	_update_mode_button()
 	_update_layer_button()
 	_refresh_selection_ui()
+	_recompute_field_grid()
 
-	get_viewport().size_changed.connect(_mark_view_changed)
-	get_viewport().size_changed.connect(_layout_left_panel)   # el menú de objetos se ajusta al alto de la ventana
+	if get_viewport() != null:
+		get_viewport().size_changed.connect(_mark_view_changed)
+		get_viewport().size_changed.connect(_layout_top_bar)
 
 func _process(delta: float) -> void:
 	mouse_world_pos = screen_to_world(get_local_mouse_position())
@@ -247,17 +409,21 @@ func _process(delta: float) -> void:
 	if dragging and not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
 		dragging = false
 		_recompute_field_lines()
+		grid_dirty = true
 
 	if rigid_dragging and not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
 		rigid_dragging = false
 		_recompute_field_lines()
+		grid_dirty = true
 
 	if conductor_dragging and not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
 		conductor_dragging = false
 		_recompute_field_lines()
+		grid_dirty = true
 
 	if mag_dragging and not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
 		mag_dragging = false
+		grid_dirty = true
 
 	if box_selecting and not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
 		_finish_box_selection(get_local_mouse_position())
@@ -267,7 +433,7 @@ func _process(delta: float) -> void:
 		_mark_view_changed()
 
 	# Flechas del teclado: mueven la cámara (velocidad constante en pantalla, sin importar el zoom)
-	if not charge_value_input.has_focus():
+	if charge_value_input != null and not charge_value_input.has_focus():
 		var move: Vector2 = Vector2(
 				Input.get_axis("ui_left", "ui_right"),
 				Input.get_axis("ui_down", "ui_up"))
@@ -280,19 +446,25 @@ func _process(delta: float) -> void:
 		var shift: Vector2 = mouse_world_pos - drag_anchor_world
 		for i in range(selected_charges.size()):
 			selected_charges[i].position = drag_start_positions[i] + shift
+		grid_dirty = true
+		_update_verification_text()
 
 	# Arrastre de un objeto rígido (imán): se mueve entero, sin deformarse
 	if rigid_dragging and selected_rigid != null:
 		var rigid_shift: Vector2 = mouse_world_pos - rigid_drag_anchor
 		selected_rigid.set_transform(rigid_drag_start_pos + rigid_shift, selected_rigid.rotation)
+		grid_dirty = true
 
 	# Arrastre de un conductor (plano o esfera)
 	if conductor_dragging and selected_conductor != null:
 		_set_conductor_pos(selected_conductor, conductor_drag_start_pos + (mouse_world_pos - conductor_drag_anchor))
+		grid_dirty = true
+		_update_verification_text()
 
 	# Arrastre de un hilo o una brújula
 	if mag_dragging and selected_mag != null:
 		selected_mag.position = mag_drag_start_pos + (mouse_world_pos - mag_drag_anchor)
+		grid_dirty = true
 
 	# Cada brújula gira su aguja hacia el campo B de ese punto
 	for item in magnetics:
@@ -306,6 +478,11 @@ func _process(delta: float) -> void:
 		view_changed_at_ms = -1
 		_recompute_field_lines()
 
+	# Recalcula la cuadrícula de flechas solo cuando sea necesario
+	if grid_dirty:
+		_recompute_field_grid()
+		grid_dirty = false
+
 	_update_scrollbars()
 	queue_redraw()
 
@@ -313,8 +490,9 @@ func _process(delta: float) -> void:
 ## (16 líneas × N cargas × hasta 800 pasos): solo cuando se agrega o borra una
 ## carga, se suelta un arrastre, se confirma un valor numérico o cambia la vista.
 func _recompute_field_lines() -> void:
+	var view_size: Vector2 = _view_size()
 	var top_left: Vector2 = screen_to_world(Vector2.ZERO)
-	var bottom_right: Vector2 = screen_to_world(get_viewport_rect().size)
+	var bottom_right: Vector2 = screen_to_world(view_size)
 	var view: Rect2 = Rect2(top_left, bottom_right - top_left).abs()
 	# Se traza en un área mayor que la visible para que las líneas de cargas
 	# que quedan justo fuera de pantalla sigan entrando a la vista.
@@ -382,6 +560,8 @@ func _unhandled_input(event: InputEvent) -> void:
 		var world_pos: Vector2 = screen_to_world(screen_pos)
 
 		if event.pressed:
+			if object_menu_container != null and object_menu_container.visible:
+				_toggle_object_menu(false)
 			var additive: bool = event.is_command_or_control_pressed() or event.shift_pressed
 			match event.button_index:
 				MOUSE_BUTTON_LEFT:
@@ -397,9 +577,15 @@ func _unhandled_input(event: InputEvent) -> void:
 					panning = true
 					pan_button = MOUSE_BUTTON_MIDDLE
 				MOUSE_BUTTON_WHEEL_UP:
-					_zoom_at(screen_pos, ZOOM_STEP)
+					if event.shift_pressed and _selected_shape_group() != null:
+						_resize_selected_ring(0.1)
+					else:
+						_zoom_at(screen_pos, ZOOM_STEP)
 				MOUSE_BUTTON_WHEEL_DOWN:
-					_zoom_at(screen_pos, 1.0 / ZOOM_STEP)
+					if event.shift_pressed and _selected_shape_group() != null:
+						_resize_selected_ring(-0.1)
+					else:
+						_zoom_at(screen_pos, 1.0 / ZOOM_STEP)
 			queue_redraw()
 		else:
 			if event.button_index == pan_button and panning:
@@ -418,22 +604,49 @@ func _unhandled_input(event: InputEvent) -> void:
 					_recompute_field_lines()
 				if box_selecting:
 					_finish_box_selection(screen_pos)
+				grid_dirty = true
+
+	elif event is InputEventScreenTouch:
+		if event.pressed:
+			touch_fingers[event.index] = event.position
+			if touch_fingers.size() == 2:
+				var p_arr: Array = touch_fingers.values()
+				initial_pinch_dist = (p_arr[0] as Vector2).distance_to(p_arr[1] as Vector2)
+				initial_pinch_zoom = pixels_per_meter
+		else:
+			touch_fingers.erase(event.index)
+			if touch_fingers.size() < 2:
+				initial_pinch_dist = 0.0
+
+	elif event is InputEventScreenDrag:
+		touch_fingers[event.index] = event.position
+		if touch_fingers.size() >= 2 and initial_pinch_dist > 10.0:
+			var p_arr: Array = touch_fingers.values()
+			var p0: Vector2 = p_arr[0]
+			var p1: Vector2 = p_arr[1]
+			var cur_dist: float = p0.distance_to(p1)
+			var pinch_center: Vector2 = (p0 + p1) * 0.5
+			var factor: float = cur_dist / initial_pinch_dist
+			var target_zoom: float = clampf(initial_pinch_zoom * factor, MIN_PIXELS_PER_METER, MAX_PIXELS_PER_METER)
+			var ratio: float = target_zoom / pixels_per_meter
+			_zoom_at(pinch_center, ratio)
+			camera_center += Vector2(-event.relative.x, event.relative.y) / pixels_per_meter * 0.5
+			grid_dirty = true
+			queue_redraw()
+		elif panning:
+			camera_center += Vector2(-event.relative.x, event.relative.y) / pixels_per_meter
+			grid_dirty = true
+			queue_redraw()
 
 	elif event is InputEventMouseMotion and panning:
 		# Arrastrar la cámara: el mundo sigue al mouse (por eso se invierte el movimiento)
 		camera_center += Vector2(-event.relative.x, event.relative.y) / pixels_per_meter
+		grid_dirty = true
 
 	elif event is InputEventKey and event.pressed:
 		match event.keycode:
 			KEY_DELETE, KEY_BACKSPACE:
-				if not selected_charges.is_empty() and not charge_value_input.has_focus():
-					_delete_selected()
-				elif selected_rigid != null and not charge_value_input.has_focus():
-					_delete_rigid(selected_rigid)
-				elif selected_conductor != null and not charge_value_input.has_focus():
-					_delete_conductor(selected_conductor)
-				elif selected_mag != null and not charge_value_input.has_focus():
-					_delete_mag(selected_mag)
+				_on_delete_pressed()
 			KEY_ESCAPE:
 				_deselect()
 			KEY_A:
@@ -445,6 +658,15 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_B:
 				if not event.echo and not charge_value_input.has_focus():
 					_toggle_layer()
+			KEY_V:
+				if not event.echo and not charge_value_input.has_focus():
+					_toggle_verification()
+			KEY_BRACKETLEFT:
+				if not event.echo and not charge_value_input.has_focus():
+					_resize_selected_ring(-0.1)
+			KEY_BRACKETRIGHT:
+				if not event.echo and not charge_value_input.has_focus():
+					_resize_selected_ring(0.1)
 			KEY_Q:
 				if not event.echo and not charge_value_input.has_focus():
 					_rotate_selected(ROTATE_FINE_DEG if event.shift_pressed else ROTATE_STEP_DEG)
@@ -460,6 +682,11 @@ func _unhandled_input(event: InputEvent) -> void:
 
 ## Clic izquierdo (sin Espacio). `additive` = Ctrl/Shift presionado.
 func _on_left_pressed(screen_pos: Vector2, world_pos: Vector2, additive: bool) -> void:
+	if mode == Mode.PAN:
+		panning = true
+		pan_button = MOUSE_BUTTON_LEFT
+		return
+
 	var hit: Charge = _find_charge_at_screen(screen_pos)
 	var rigid_hit: RigidObject = _find_rigid_at_screen(screen_pos)
 	var mag_hit = _find_mag_at_screen(screen_pos)
@@ -488,7 +715,7 @@ func _on_left_pressed(screen_pos: Vector2, world_pos: Vector2, additive: bool) -
 		_select_conductor(_find_conductor_at(world_pos))
 		_begin_conductor_drag(world_pos)
 	elif mode == Mode.PLACE:
-		_place_at(world_pos, 1.0)
+		_place_at(world_pos, place_sign)
 	else:
 		# Modo seleccionar: empieza un recuadro (si no se arrastra, es un clic en vacío)
 		box_selecting = true
@@ -590,6 +817,7 @@ func _rotate_selected(deg: float) -> void:
 ## Atiende al menu desplegable "Objetos". Varilla, varillas y anillo (y "Carga normal") solo cambian
 ## la HERRAMIENTA de colocacion; el imán y los conductores se agregan al centro de la vista.
 func _on_object_requested(kind: String) -> void:
+	_toggle_object_menu(false)
 	var spawn: Vector2 = camera_center + Vector2(0.4, -0.4) * float((shape_groups.size() + conductors.size()) % 5)
 	match kind:
 		"normal_charge":
@@ -606,6 +834,26 @@ func _on_object_requested(kind: String) -> void:
 			_add_conductor(ConductorPlane.new(spawn + PLANE_SPAWN_OFFSET, Vector2.RIGHT))
 		"conductor_sphere":
 			_add_conductor(ConductorSphere.new(spawn + SPHERE_SPAWN_OFFSET, SPHERE_RADIUS_M))
+		"manage_experiments":
+			_toggle_experiment_dialog(true)
+		"save_json":
+			_on_save_button_pressed()
+		"load_json":
+			_on_load_button_pressed()
+		"clear_all":
+			clear_all()
+		"exp_dipole":
+			load_experiment("dipole")
+		"exp_equal_charges":
+			load_experiment("equal_charges")
+		"exp_faraday":
+			load_experiment("faraday")
+		"exp_plane_ground":
+			load_experiment("plane_ground")
+		"exp_parallel_plates":
+			load_experiment("parallel_plates")
+		"exp_wire_compasses":
+			load_experiment("wire_compasses")
 	if object_menu != null:
 		object_menu.set_active_tool(armed_tool)
 
@@ -622,18 +870,18 @@ func _place_at(world_pos: Vector2, sign_val: float) -> void:
 	var q: float = sign_val * next_charge_uC * PhysicsConstants.MICRO
 	match armed_tool:
 		"rod":
-			_add_shape(ChargedShapes.make_rod(world_pos, SHAPE_LENGTH_M, 0.0, q, SHAPE_POINTS), false, false)
+			_add_shape(ChargedShapes.make_rod(world_pos, SHAPE_LENGTH_M, 0.0, q, SHAPE_POINTS), false, false, "rod", 0.0, world_pos)
 		"rod_pair":
-			_add_shape(ChargedShapes.make_rod_pair(world_pos, SHAPE_LENGTH_M, PAIR_SEPARATION_M, 0.0, q, SHAPE_POINTS), false, false)
+			_add_shape(ChargedShapes.make_rod_pair(world_pos, SHAPE_LENGTH_M, PAIR_SEPARATION_M, 0.0, q, SHAPE_POINTS), false, false, "rod_pair", 0.0, world_pos)
 		"ring":
-			_add_shape(ChargedShapes.make_ring(world_pos, RING_RADIUS_M, q, SHAPE_POINTS), true, false)
+			_add_shape(ChargedShapes.make_ring(world_pos, RING_RADIUS_M, q, SHAPE_POINTS), true, false, "ring", RING_RADIUS_M, world_pos)
 		_:
 			_add_charge(world_pos, q)
 	_deselect()
 
 ## Agrega una forma (varilla, anillo...) como grupo de cargas. Con select = true la deja seleccionada.
-func _add_shape(points: Array, closed: bool, select: bool = true) -> void:
-	var group: Dictionary = {"points": points, "closed": closed}
+func _add_shape(points: Array, closed: bool, select: bool = true, type: String = "", radius: float = 0.0, center: Vector2 = Vector2.ZERO) -> void:
+	var group: Dictionary = {"points": points, "closed": closed, "type": type, "radius": radius, "center": center}
 	shape_groups.append(group)
 	for c in points:
 		charges.append(c)
@@ -991,13 +1239,12 @@ func _scroll_world_rect(view_m: Vector2) -> Rect2:
 func _update_scrollbars() -> void:
 	if h_scroll == null or v_scroll == null:
 		return
-	var view: Vector2 = get_viewport_rect().size
+	var view: Vector2 = _view_size()
 	var bar: float = SCROLLBAR_PX
-	var top_edge: float = bar if H_SCROLL_AT_TOP else 0.0
-	h_scroll.position = Vector2(0.0, 0.0 if H_SCROLL_AT_TOP else view.y - bar)
+	h_scroll.position = Vector2(0.0, view.y - bar)
 	h_scroll.size = Vector2(view.x - bar, bar)
-	v_scroll.position = Vector2(view.x - bar, top_edge)
-	v_scroll.size = Vector2(bar, view.y - bar)
+	v_scroll.position = Vector2(view.x - bar, TOP_BAR_HEIGHT)
+	v_scroll.size = Vector2(bar, view.y - bar - TOP_BAR_HEIGHT)
 
 	var view_m: Vector2 = view / pixels_per_meter
 	scroll_rect = _scroll_world_rect(view_m)
@@ -1025,9 +1272,6 @@ func _on_v_scroll(value: float) -> void:
 	camera_center.y = scroll_rect.end.y - value - get_viewport_rect().size.y / pixels_per_meter / 2.0
 	_mark_view_changed()
 
-## Alto del panel izquierdo: llega hasta donde termina el menú de objetos (abierto o cerrado).
-func _left_panel_height() -> float:
-	return OBJECT_MENU_Y + object_menu.get_combined_minimum_size().y
 
 # ---------- Capas (eléctrica / magnética) ----------
 
@@ -1153,60 +1397,133 @@ func _finish_box_selection(end_screen: Vector2) -> void:
 			result.append(charge)
 	_set_selection(result)
 
-## Sincroniza el campo de valor, su etiqueta y el botón "Deseleccionar" con la selección actual.
+## Sincroniza el campo de valor, su etiqueta y los botones con la selección actual.
 func _refresh_selection_ui() -> void:
 	var n: int = selected_charges.size()
+	var has_selection: bool = (n > 0 or selected_rigid != null or selected_conductor != null or selected_mag != null)
 	if deselect_button != null:
-		deselect_button.disabled = (n == 0 and selected_rigid == null and selected_conductor == null and selected_mag == null)
+		deselect_button.disabled = not has_selection
+	if delete_button != null:
+		delete_button.disabled = not has_selection
 	if rotate_ccw_button != null:
 		rotate_ccw_button.disabled = not _can_rotate()
 		rotate_cw_button.disabled = not _can_rotate()
 
-	charge_value_input.placeholder_text = "1.0"
-	if selected_mag is CurrentWire:
-		charge_value_input.text = "%.2f" % selected_mag.current
-		charge_value_label.text = "Corriente (A, + sale, − entra):"
-	elif selected_mag != null:
-		charge_value_input.text = ""
-		charge_value_label.text = "Brújula (sin valor editable)"
-	elif n == 0:
-		charge_value_input.text = "%.2f" % next_charge_uC
-		charge_value_label.text = "Valor de carga a colocar (µC):"
-	elif not _selected_group().is_empty():
-		charge_value_input.text = "%.2f" % (_group_total(_selected_group()) / PhysicsConstants.MICRO)
-		charge_value_label.text = "Carga total (µC, + o −):"
-	elif n == 1:
-		charge_value_input.text = "%.2f" % (selected_charges[0].q / PhysicsConstants.MICRO)
-		charge_value_label.text = "Carga (µC, + o −):"
-	else:
-		charge_value_label.text = "Magnitud de las %d cargas (µC):" % n
-		# Si todas tienen la misma magnitud se muestra; si no, el campo queda vacío
-		var first: float = absf(selected_charges[0].q)
-		var same: bool = true
-		for charge in selected_charges:
-			if absf(absf(charge.q) - first) > first * 1e-9:
-				same = false
-				break
-		if same:
-			charge_value_input.text = "%.2f" % (first / PhysicsConstants.MICRO)
+	var shape_group = _selected_shape_group()
+	var is_ring: bool = (shape_group != null and shape_group.get("type", "") == "ring")
+	if ring_minus_button != null and ring_plus_button != null:
+		ring_minus_button.disabled = not is_ring
+		ring_plus_button.disabled = not is_ring
+		if is_ring:
+			var r_val: float = shape_group.get("radius", RING_RADIUS_M)
+			ring_minus_button.text = "Radio − (%.1fm)" % r_val
+			ring_plus_button.text = "Radio + (%.1fm)" % r_val
 		else:
-			charge_value_input.text = ""
-			charge_value_input.placeholder_text = "varios"
+			ring_minus_button.text = "Radio Anillo −"
+			ring_plus_button.text = "Radio Anillo +"
 
-# ---------- Modos ----------
+	if sign_button != null:
+		sign_button.visible = (mode == Mode.PLACE)
+
+	if charge_value_input != null:
+		charge_value_input.placeholder_text = "1.0"
+		if selected_mag is CurrentWire:
+			charge_value_input.text = "%.2f" % selected_mag.current
+			if charge_value_label != null:
+				charge_value_label.text = "Corriente (A, + sale, − entra):"
+		elif selected_mag != null:
+			charge_value_input.text = ""
+			if charge_value_label != null:
+				charge_value_label.text = "Brújula (sin valor editable)"
+		elif n == 0:
+			charge_value_input.text = "%.2f" % next_charge_uC
+			if charge_value_label != null:
+				charge_value_label.text = "Valor de carga a colocar (µC):"
+		elif not _selected_group().is_empty():
+			charge_value_input.text = "%.2f" % (_group_total(_selected_group()) / PhysicsConstants.MICRO)
+			if charge_value_label != null:
+				charge_value_label.text = "Carga total (µC, + o −):"
+		elif n == 1:
+			charge_value_input.text = "%.2f" % (selected_charges[0].q / PhysicsConstants.MICRO)
+			if charge_value_label != null:
+				charge_value_label.text = "Carga (µC, + o −):"
+		else:
+			if charge_value_label != null:
+				charge_value_label.text = "Magnitud de las %d cargas (µC):" % n
+			var first: float = absf(selected_charges[0].q)
+			var same: bool = true
+			for charge in selected_charges:
+				if absf(absf(charge.q) - first) > first * 1e-9:
+					same = false
+					break
+			if same:
+				charge_value_input.text = "%.2f" % (first / PhysicsConstants.MICRO)
+			else:
+				charge_value_input.text = ""
+				charge_value_input.placeholder_text = "varios"
+
+	_update_verification_text()
+
+# ---------- Modos y Acciones Táctiles ----------
 
 func _toggle_mode() -> void:
-	mode = Mode.SELECT if mode == Mode.PLACE else Mode.PLACE
+	if mode == Mode.PLACE:
+		mode = Mode.SELECT
+	elif mode == Mode.SELECT:
+		mode = Mode.PAN
+	else:
+		mode = Mode.PLACE
 	box_selecting = false
+	panning = false
 	_update_mode_button()
+	_refresh_selection_ui()
 
 func _update_mode_button() -> void:
 	if mode_button == null:
 		return
-	if mode == Mode.PLACE:
-		mode_button.text = "Modo: COLOCAR  (M para cambiar)"
+	match mode:
+		Mode.PLACE:
+			mode_button.text = "Modo: COLOCAR (M)"
+		Mode.SELECT:
+			mode_button.text = "Modo: SELECCIONAR (M)"
+		Mode.PAN:
+			mode_button.text = "Modo: MOVER CÁMARA 🖐️ (M)"
+
+func _toggle_place_sign() -> void:
+	place_sign = -1.0 if place_sign > 0.0 else 1.0
+	_update_sign_button()
+
+func _update_sign_button() -> void:
+	if sign_button == null:
+		return
+	if place_sign > 0.0:
+		sign_button.text = "Carga a colocar: POSITIVA (+)"
 	else:
-		mode_button.text = "Modo: SELECCIONAR  (M para cambiar)"
+		sign_button.text = "Carga a colocar: NEGATIVA (−)"
+
+func _on_delete_pressed() -> void:
+	if not selected_charges.is_empty():
+		_delete_selected()
+	elif selected_rigid != null:
+		rigid_objects.erase(selected_rigid)
+		selected_rigid = null
+		rigid_dragging = false
+		_recompute_field_lines()
+		grid_dirty = true
+		_refresh_selection_ui()
+		queue_redraw()
+	elif selected_conductor != null:
+		conductors.erase(selected_conductor)
+		selected_conductor = null
+		conductor_dragging = false
+		_recompute_field_lines()
+		grid_dirty = true
+		_refresh_selection_ui()
+		queue_redraw()
+	elif selected_mag != null:
+		_delete_mag(selected_mag)
+		grid_dirty = true
+		queue_redraw()
 
 # ---------- Zoom y cámara ----------
 
@@ -1227,16 +1544,19 @@ func _reset_view() -> void:
 func _mark_view_changed() -> void:
 	view_changed_at_ms = Time.get_ticks_msec()
 
+func _view_size() -> Vector2:
+	return get_viewport_rect().size if is_inside_tree() else Vector2(1152.0, 648.0)
+
 # ---------- Conversión de coordenadas: pantalla (px) <-> mundo físico (m) ----------
 # Implementa la sección 9 del documento: screen_to_world() / world_to_screen()
 func world_to_screen(world_pos: Vector2) -> Vector2:
-	var center: Vector2 = get_viewport_rect().size / 2.0
+	var center: Vector2 = _view_size() / 2.0
 	var rel: Vector2 = world_pos - camera_center
 	# El eje Y de pantalla crece hacia abajo; el eje Y físico crece hacia arriba
 	return center + Vector2(rel.x, -rel.y) * pixels_per_meter
 
 func screen_to_world(screen_pos: Vector2) -> Vector2:
-	var center: Vector2 = get_viewport_rect().size / 2.0
+	var center: Vector2 = _view_size() / 2.0
 	var diff: Vector2 = screen_pos - center
 	return Vector2(diff.x, -diff.y) / pixels_per_meter + camera_center
 
@@ -1254,7 +1574,7 @@ func _draw() -> void:
 	_draw_magnetic_items()
 	_draw_charges()
 	_draw_selection_box()
-	_draw_cursor_panel()
+	_draw_status_bar()
 	_draw_inspector_panel()
 
 ## Paso "redondo" (1, 2 o 5 × 10^n) lo más cercano al valor pedido.
@@ -1355,22 +1675,12 @@ func _draw_magnetic_lines() -> void:
 		if screen_points.size() > 1:
 			draw_polyline(screen_points, color, 1.5, true)
 
-## Cuadrícula de flechas de B (mismo esquema que la eléctrica, escala logarítmica).
+## Cuadrícula de flechas de B (dibujadas desde caché optimizado).
 func _draw_magnetic_grid() -> void:
-	var poles: Array = _all_poles()
-	if poles.is_empty() and not _has_wires():
-		return
-	var view_size: Vector2 = get_viewport_rect().size
-	var color: Color = Color(0.45, 1.0, 0.55, 0.85)
-	var x: float = GRID_STEP_PX / 2.0
-	while x < view_size.x:
-		var y: float = GRID_STEP_PX / 2.0
-		while y < view_size.y:
-			var screen_point: Vector2 = Vector2(x, y)
-			var b: Vector2 = _magnetic_field_with_poles(poles, screen_to_world(screen_point))
-			_draw_arrow(screen_point, b, color, B_ARROW_REFERENCE, B_ARROW_GAIN)
-			y += GRID_STEP_PX
-		x += GRID_STEP_PX
+	for a in cached_mag_arrows:
+		draw_line(a["origin"], a["end"], a["color"], 2.0)
+		draw_line(a["end"], a["p1"], a["color"], 2.0)
+		draw_line(a["end"], a["p2"], a["color"], 2.0)
 
 ## Dibuja los objetos rígidos. Cada polo es una mitad de la barra (centro -> polo):
 ## rojo = norte, azul = sur, con su letra. El seleccionado lleva borde amarillo.
@@ -1407,89 +1717,111 @@ func _draw_selection_box() -> void:
 	draw_rect(rect, Color(1.0, 0.9, 0.2, 0.12), true)
 	draw_rect(rect, Color(1.0, 0.9, 0.2, 0.9), false, 1.5)
 
-## Cuadrícula de vectores de campo (sección 12 del documento)
+## Cuadrícula de vectores de campo eléctrico (dibujadas desde caché optimizado).
 func _draw_field_grid() -> void:
-	var view_size: Vector2 = get_viewport_rect().size
-	var sources: Array = InducedSystem.sources(charges, conductors)   # cargas libres + imágenes
-	var x: float = GRID_STEP_PX / 2.0
-	while x < view_size.x:
-		var y: float = GRID_STEP_PX / 2.0
-		while y < view_size.y:
-			var screen_point: Vector2 = Vector2(x, y)
-			var world_point: Vector2 = screen_to_world(screen_point)
-			if not InducedSystem.is_inside_any(world_point, conductors):   # dentro del metal E = 0
-				_draw_arrow(screen_point, ElectricFieldEngine.total_field(sources, world_point))
-			y += GRID_STEP_PX
-		x += GRID_STEP_PX
+	for a in cached_arrows:
+		draw_line(a["origin"], a["end"], a["color"], 2.0)
+		draw_line(a["end"], a["p1"], a["color"], 2.0)
+		draw_line(a["end"], a["p2"], a["color"], 2.0)
 
-## Dibuja una flecha con longitud comprimida logarítmicamente (sección 10: "escala
-## visual" para que el campo no explote visualmente cerca de una carga)
-func _draw_arrow(origin: Vector2, field: Vector2, color: Color = Color(0.3, 0.75, 1.0, 0.85),
-		reference: float = 1.0, gain: float = 2.0) -> void:
+## Recalcula el arreglo en caché de flechas de campo eléctrico y magnético.
+## Solo se ejecuta cuando grid_dirty es true o cambia la vista/fuentes.
+func _recompute_field_grid() -> void:
+	cached_arrows.clear()
+	cached_mag_arrows.clear()
+	var view_size: Vector2 = get_viewport_rect().size
+	var is_moving: bool = dragging or panning or rigid_dragging or conductor_dragging or mag_dragging
+	var step: float = float(GRID_STEP_PX * 2) if is_moving else float(GRID_STEP_PX)
+	last_grid_step = int(step)
+
+	if layer == Layer.ELECTRIC:
+		var sources: Array = InducedSystem.sources(charges, conductors)
+		if sources.is_empty():
+			return
+		var x: float = step / 2.0
+		while x < view_size.x:
+			var y: float = step / 2.0
+			while y < view_size.y:
+				var screen_point: Vector2 = Vector2(x, y)
+				var world_point: Vector2 = screen_to_world(screen_point)
+				if not InducedSystem.is_inside_any(world_point, conductors):
+					var fld: Vector2 = ElectricFieldEngine.total_field(sources, world_point)
+					var arrow: Variant = _make_arrow_geom(screen_point, fld, Color(0.3, 0.75, 1.0, 0.85), 1.0, 2.0)
+					if arrow != null:
+						cached_arrows.append(arrow)
+				y += step
+			x += step
+	else:
+		var poles: Array = _all_poles()
+		if poles.is_empty() and not _has_wires():
+			return
+		var color: Color = Color(0.45, 1.0, 0.55, 0.85)
+		var x: float = step / 2.0
+		while x < view_size.x:
+			var y: float = step / 2.0
+			while y < view_size.y:
+				var screen_point: Vector2 = Vector2(x, y)
+				var b: Vector2 = _magnetic_field_with_poles(poles, screen_to_world(screen_point))
+				var arrow: Variant = _make_arrow_geom(screen_point, b, color, B_ARROW_REFERENCE, B_ARROW_GAIN)
+				if arrow != null:
+					cached_mag_arrows.append(arrow)
+				y += step
+			x += step
+
+## Precalcula la geometría de una flecha logarítmica para que el dibujado sea ultra-rápido.
+func _make_arrow_geom(origin: Vector2, field: Vector2, color: Color, reference: float, gain: float) -> Variant:
 	var magnitude: float = field.length()
 	if magnitude < reference:
-		return
-
+		return null
 	var visual_length: float = clamp(log(1.0 + magnitude / reference) * gain, 4.0, ARROW_MAX_LENGTH)
 	var direction: Vector2 = field.normalized()
-	var screen_dir: Vector2 = Vector2(direction.x, -direction.y)  # invertir Y para pantalla
+	var screen_dir: Vector2 = Vector2(direction.x, -direction.y)
 	var end_point: Vector2 = origin + screen_dir * visual_length
-
-	draw_line(origin, end_point, color, 2.0)
 	var arrow_dir: Vector2 = (end_point - origin).normalized()
 	var perp: Vector2 = Vector2(-arrow_dir.y, arrow_dir.x)
-	draw_line(end_point, end_point - arrow_dir * 7.0 + perp * 4.0, color, 2.0)
-	draw_line(end_point, end_point - arrow_dir * 7.0 - perp * 4.0, color, 2.0)
+	var p1: Vector2 = end_point - arrow_dir * 7.0 + perp * 4.0
+	var p2: Vector2 = end_point - arrow_dir * 7.0 - perp * 4.0
+	return {"origin": origin, "end": end_point, "p1": p1, "p2": p2, "color": color}
 
 # ---------- Paneles de información ----------
 
-## Panel izquierdo: coordenadas del cursor y ayuda según el modo y la selección.
-## (Los controles —campo de valor y botones— son nodos de UI colocados encima.)
-func _draw_cursor_panel() -> void:
+## Barra de estado flotante en la esquina inferior izquierda: coordenadas y ayuda contextual.
+func _draw_status_bar() -> void:
 	var font: Font = ThemeDB.fallback_font
 	var n: int = selected_charges.size()
-	var lines: Array = []
-	lines.append("x = %.2f m,   y = %.2f m" % [mouse_world_pos.x, mouse_world_pos.y])
+	var text: String = "x = %.2f m,  y = %.2f m" % [mouse_world_pos.x, mouse_world_pos.y]
+
 	if selected_rigid != null:
-		lines.append("Seleccionado: %s" % selected_rigid.label)
-		lines.append("Arrastrar · Q/E rotar · Supr borrar")
+		text += "  |  Imán: %s (Arrastrar · Q/E rotar · Borrar)" % selected_rigid.label
 	elif selected_mag != null:
-		lines.append("Seleccionado: %s" % _mag_name(selected_mag))
-		lines.append("Arrastrar · Supr borrar" + (" · valor = corriente" if selected_mag is CurrentWire else ""))
+		text += "  |  %s (Arrastrar · Borrar)" % _mag_name(selected_mag)
 	elif selected_conductor != null:
-		lines.append("Seleccionado: %s" % _conductor_name(selected_conductor))
-		lines.append("Arrastrar · Q/E rotar · Supr borrar" if selected_conductor is ConductorPlane else "Arrastrar · Supr borrar")
+		text += "  |  %s (Arrastrar · Borrar)" % _conductor_name(selected_conductor)
 	elif n == 1:
-		var value_uC: float = selected_charges[0].q / PhysicsConstants.MICRO
-		lines.append("Seleccionada: %s" % _format_charge_label(value_uC))
-		lines.append("Arrastra: mover   ·   Supr: borrar")
+		text += "  |  Carga: %s (Arrastrar · Borrar)" % _format_charge_label(selected_charges[0].q / PhysicsConstants.MICRO)
 	elif not _selected_group().is_empty():
-		lines.append("Forma seleccionada: %d cargas" % n)
-		lines.append("Arrastrar · Q/E rotar · Supr borrar")
+		text += "  |  Forma: %d cargas (Arrastrar · Q/E rotar · Borrar)" % n
 	elif n > 1:
-		lines.append("Seleccionadas: %d cargas" % n)
-		lines.append("Arrastra: mover grupo  ·  Supr: borrar")
+		text += "  |  %d cargas seleccionadas (Arrastrar grupo · Borrar)" % n
 	elif mode == Mode.PLACE and armed_tool != "":
-		lines.append("Herramienta: %s" % TOOL_NAMES[armed_tool])
-		lines.append("Izq: +%.2f µC  ·  Der: -%.2f µC" % [next_charge_uC, next_charge_uC])
+		text += "  |  Herramienta: %s (Tocar para colocar)" % TOOL_NAMES.get(armed_tool, armed_tool)
 	elif mode == Mode.PLACE:
-		lines.append("Click izq: +%.2f µC" % next_charge_uC)
-		lines.append("Click der: -%.2f µC" % next_charge_uC)
+		text += "  |  Tocar para colocar carga %s" % ("positiva (+)" if place_sign > 0 else "negativa (−)")
+	elif mode == Mode.PAN:
+		text += "  |  Modo Mover Cámara: arrastra con el dedo o mouse para desplazar"
 	else:
-		lines.append("Arrastra en vacío: recuadro")
-		lines.append("Ctrl+clic: sumar  ·  Ctrl+A: todas")
+		text += "  |  Arrastra para recuadro · Ctrl+A: todas"
 
-	draw_rect(Rect2(PANEL_MARGIN_PX, PANEL_MARGIN_PX, LEFT_PANEL_WIDTH, _left_panel_height()), Color(0, 0, 0, 0.6))
+	var text_w: float = font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, 13).x
+	var badge_w: float = text_w + 24.0
+	var badge_h: float = 28.0
+	var vp_size: Vector2 = _view_size()
+	var pos_y: float = vp_size.y - SCROLLBAR_PX - badge_h - 8.0
+	var pos_x: float = 12.0
 
-	for i in range(lines.size()):
-		var pos: Vector2 = Vector2(PANEL_MARGIN_PX + PANEL_PADDING_PX, PANEL_MARGIN_PX + 18.0 + i * LINE_HEIGHT_PX)
-		draw_string(font, pos, lines[i], HORIZONTAL_ALIGNMENT_LEFT, -1, PANEL_FONT_SIZE, Color.WHITE)
-
-	# Línea separadora entre la información y los controles
-	var sep_y: float = 84.0
-	draw_line(Vector2(PANEL_MARGIN_PX + PANEL_PADDING_PX, sep_y),
-			Vector2(PANEL_MARGIN_PX + LEFT_PANEL_WIDTH - PANEL_PADDING_PX, sep_y),
-			Color(1, 1, 1, 0.25), 1.0)
+	draw_rect(Rect2(pos_x, pos_y, badge_w, badge_h), Color(0.08, 0.10, 0.15, 0.88))
+	draw_rect(Rect2(pos_x, pos_y, badge_w, badge_h), Color(0.28, 0.38, 0.55, 0.6), false, 1.0)
+	draw_string(font, Vector2(pos_x + 12.0, pos_y + 19.0), text, HORIZONTAL_ALIGNMENT_LEFT, -1, 13, Color(0.9, 0.95, 1.0))
 
 ## Inspector (arriba a la derecha): estadísticas de la selección.
 ## Las filas las calcula ChargeStats; aquí solo se formatean y se dibujan, así que
@@ -1534,7 +1866,7 @@ func _draw_rigid_inspector() -> void:
 
 ## Dibuja un panel de texto semitransparente que se ajusta al ancho del contenido.
 ## `entries`: Array de Diccionarios {"text": String, "header": bool}.
-## Si right_aligned es true, el panel se ancla a la esquina superior derecha.
+## Si right_aligned es true, el panel se ancla a la esquina superior derecha (debajo de la barra superior).
 func _draw_panel(entries: Array, right_aligned: bool) -> void:
 	var font: Font = ThemeDB.fallback_font
 
@@ -1547,41 +1879,52 @@ func _draw_panel(entries: Array, right_aligned: bool) -> void:
 	var height: float = LINE_HEIGHT_PX * entries.size() + 12.0
 	var origin_x: float = PANEL_MARGIN_PX
 	if right_aligned:
-		origin_x = get_viewport_rect().size.x - width - PANEL_MARGIN_PX - SCROLLBAR_PX
+		origin_x = _view_size().x - width - PANEL_MARGIN_PX - SCROLLBAR_PX
 
-	draw_rect(Rect2(origin_x, PANEL_MARGIN_PX, width, height), Color(0, 0, 0, 0.6))
+	var origin_y: float = TOP_BAR_HEIGHT + 10.0
+
+	draw_rect(Rect2(origin_x, origin_y, width, height), Color(0.08, 0.10, 0.15, 0.92))
+	draw_rect(Rect2(origin_x, origin_y, width, height), Color(0.30, 0.45, 0.70, 0.7), false, 1.5)
 
 	for i in range(entries.size()):
 		var entry: Dictionary = entries[i]
 		var text_color: Color = Color(1.0, 0.85, 0.3) if entry["header"] else Color.WHITE
-		var pos: Vector2 = Vector2(origin_x + PANEL_PADDING_PX, PANEL_MARGIN_PX + 18.0 + i * LINE_HEIGHT_PX)
+		var pos: Vector2 = Vector2(origin_x + PANEL_PADDING_PX, origin_y + 18.0 + i * LINE_HEIGHT_PX)
 		draw_string(font, pos, entry["text"], HORIZONTAL_ALIGNMENT_LEFT, -1, PANEL_FONT_SIZE, text_color)
 
-## Acomoda etiqueta, campo de texto y botones DENTRO del panel izquierdo.
-## Las posiciones se fijan aquí (no en Main.tscn) para que queden alineadas
-## con el rectángulo que dibuja _draw_cursor_panel().
-func _layout_left_panel() -> void:
-	var x: float = PANEL_MARGIN_PX + PANEL_PADDING_PX
-	var w: float = LEFT_PANEL_WIDTH - PANEL_PADDING_PX * 2.0
-	charge_value_label.position = Vector2(x, 92.0)
-	charge_value_label.size = Vector2(w, 24.0)
-	charge_value_input.position = Vector2(x, 118.0)
-	charge_value_input.size = Vector2(w, 28.0)
-	deselect_button.position = Vector2(x, 154.0)
-	deselect_button.size = Vector2(w, 28.0)
-	mode_button.position = Vector2(x, 190.0)
-	mode_button.size = Vector2(w, 28.0)
-	layer_button.position = Vector2(x, 226.0)
-	layer_button.size = Vector2(w, 28.0)
-	var half: float = (w - 8.0) / 2.0
-	rotate_ccw_button.position = Vector2(x, 262.0)
-	rotate_ccw_button.size = Vector2(half, 28.0)
-	rotate_cw_button.position = Vector2(x + half + 8.0, 262.0)
-	rotate_cw_button.size = Vector2(half, 28.0)
-	object_menu.position = Vector2(x, OBJECT_MENU_Y)
-	object_menu.set_width(w)
-	# El menú no puede pasar del borde inferior de la ventana: si no cabe, hace scroll por dentro
-	object_menu.set_max_height(get_viewport_rect().size.y - OBJECT_MENU_Y - PANEL_MARGIN_PX * 2.0)
+## Acomoda la barra superior y los diálogos flotantes al tamaño de la ventana.
+func _layout_top_bar() -> void:
+	var vp_w: float = _view_size().x
+	if top_bar != null:
+		top_bar.position = Vector2(0.0, 0.0)
+		top_bar.size = Vector2(vp_w, TOP_BAR_HEIGHT)
+
+	if object_menu_container != null:
+		object_menu_container.position = Vector2(10.0, TOP_BAR_HEIGHT + 2.0)
+		object_menu_container.custom_minimum_size.x = 260.0
+		if object_menu != null:
+			object_menu.set_width(248.0)
+			object_menu.set_max_height(_view_size().y - TOP_BAR_HEIGHT - 40.0)
+
+	_layout_verification_panel()
+	_layout_experiment_dialog()
+
+func _create_ribbon_separator() -> VSeparator:
+	var sep: VSeparator = VSeparator.new()
+	sep.add_theme_constant_override("separation", 10)
+	sep.custom_minimum_size = Vector2(1.0, 26.0)
+	sep.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	return sep
+
+func _toggle_object_menu(force_state = null) -> void:
+	if object_menu_container == null:
+		return
+	var next_state: bool = (not object_menu_container.visible) if (force_state == null) else bool(force_state)
+	object_menu_container.visible = next_state
+	if object_menu_btn != null:
+		object_menu_btn.text = "📦 Objetos [▲]" if next_state else "📦 Objetos [▼]"
+	if next_state:
+		_layout_top_bar()
 
 # ---------- Formato de texto ----------
 
@@ -1642,3 +1985,692 @@ func _format_physics(value: float) -> String:
 		exponent += 1
 
 	return "%.3f × 10^%d" % [mantissa, exponent]
+
+# ---------- Verificación para Calculadora (Feature A) ----------
+
+## Inicializa la ventana flotante de verificación paso a paso para calculadora.
+func _setup_verification_ui() -> void:
+	verification_panel = PanelContainer.new()
+	verification_panel.visible = false
+
+	var style: StyleBoxFlat = StyleBoxFlat.new()
+	style.bg_color = Color(0.07, 0.09, 0.13, 0.96)
+	style.border_color = Color(0.3, 0.6, 1.0, 0.8)
+	style.border_width_left = 2
+	style.border_width_top = 2
+	style.border_width_right = 2
+	style.border_width_bottom = 2
+	style.corner_radius_top_left = 8
+	style.corner_radius_top_right = 8
+	style.corner_radius_bottom_left = 8
+	style.corner_radius_bottom_right = 8
+	verification_panel.add_theme_stylebox_override("panel", style)
+
+	var margin: MarginContainer = MarginContainer.new()
+	margin.add_theme_constant_override("margin_left", 14)
+	margin.add_theme_constant_override("margin_top", 12)
+	margin.add_theme_constant_override("margin_right", 14)
+	margin.add_theme_constant_override("margin_bottom", 12)
+	verification_panel.add_child(margin)
+
+	var vbox: VBoxContainer = VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", 10)
+	margin.add_child(vbox)
+
+	var header_hbox: HBoxContainer = HBoxContainer.new()
+	vbox.add_child(header_hbox)
+
+	var title_lbl: Label = Label.new()
+	title_lbl.text = "🔬 Verificación Paso a Paso (Calculadora - Ley de Coulomb)"
+	title_lbl.add_theme_font_size_override("font_size", 16)
+	title_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	header_hbox.add_child(title_lbl)
+
+	var copy_btn: Button = Button.new()
+	copy_btn.text = "📋 Copiar datos"
+	copy_btn.custom_minimum_size = Vector2(120.0, 36.0)
+	copy_btn.focus_mode = Control.FOCUS_NONE
+	copy_btn.pressed.connect(_on_copy_verification_pressed)
+	header_hbox.add_child(copy_btn)
+
+	var close_btn: Button = Button.new()
+	close_btn.text = " ✕ "
+	close_btn.custom_minimum_size = Vector2(40.0, 36.0)
+	close_btn.focus_mode = Control.FOCUS_NONE
+	close_btn.pressed.connect(func(): _toggle_verification(false))
+	header_hbox.add_child(close_btn)
+
+	verification_text_edit = TextEdit.new()
+	verification_text_edit.editable = false
+	verification_text_edit.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	verification_text_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	verification_text_edit.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+	vbox.add_child(verification_text_edit)
+
+	$UI.add_child(verification_panel)
+	_layout_verification_panel()
+
+## Posiciona y redimensiona el panel de verificación flotante.
+func _layout_verification_panel() -> void:
+	if verification_panel == null:
+		return
+	var vp_size: Vector2 = _view_size()
+	var panel_w: float = clampf(vp_size.x - 40.0, 480.0, 840.0)
+	var panel_h: float = clampf(vp_size.y - TOP_BAR_HEIGHT - 40.0, 360.0, 680.0)
+	verification_panel.size = Vector2(panel_w, panel_h)
+	verification_panel.position = Vector2(
+		maxf(10.0, (vp_size.x - panel_w) / 2.0),
+		maxf(TOP_BAR_HEIGHT + 10.0, (vp_size.y - panel_h) / 2.0)
+	)
+
+## Abre o cierra el panel de verificación para calculadora.
+func _toggle_verification(force_state = null) -> void:
+	if verification_panel == null:
+		return
+	var next_state: bool = (not verification_panel.visible) if (force_state == null) else bool(force_state)
+	verification_panel.visible = next_state
+	if next_state:
+		_layout_verification_panel()
+		_update_verification_text()
+
+## Actualiza el texto de verificación si el panel está abierto.
+func _update_verification_text() -> void:
+	if verification_panel == null or not verification_panel.visible:
+		return
+	var sources: Array = InducedSystem.sources(charges, conductors)
+	verification_text_edit.text = ChargeStats.verification_text(selected_charges, sources)
+
+## Copia el informe de verificación al portapapeles del sistema operativo.
+func _on_copy_verification_pressed() -> void:
+	if verification_text_edit != null:
+		DisplayServer.clipboard_set(verification_text_edit.text)
+
+# ---------- Redimensionar formas (Anillo / Jaula de Faraday) ----------
+
+## Si la selección contiene una sola forma, devuelve el diccionario del grupo; si no, null.
+func _selected_shape_group() -> Variant:
+	if selected_charges.size() < 2:
+		return null
+	var group: Variant = charge_group.get(selected_charges[0])
+	if group == null:
+		return null
+	if group["points"].size() != selected_charges.size():
+		return null
+	for c in selected_charges:
+		if not group["points"].has(c):
+			return null
+	return group
+
+## Cambia el radio del anillo seleccionado uniformemente redistribuyendo sus cargas.
+func _resize_selected_ring(delta_radius: float) -> void:
+	var group: Variant = _selected_shape_group()
+	if group == null or group.get("type", "") != "ring":
+		return
+	var pts: Array = group.get("points", [])
+	if pts.is_empty():
+		return
+	var center_sum: Vector2 = Vector2.ZERO
+	for p in pts:
+		center_sum += p.position
+	group["center"] = center_sum / float(pts.size())
+	var current_r: float = group.get("radius", RING_RADIUS_M)
+	var new_r: float = clampf(current_r + delta_radius, 0.3, 10.0)
+	ChargedShapes.resize_ring(group, new_r)
+	_recompute_field_lines()
+	grid_dirty = true
+	_update_verification_text()
+	_refresh_selection_ui()
+	queue_redraw()
+
+# ---------- Gestor Académico de Experimentos (JSON / Portapapeles / Archivos) ----------
+
+func _setup_experiment_dialog() -> void:
+	experiment_dialog = PanelContainer.new()
+	experiment_dialog.visible = false
+
+	var style: StyleBoxFlat = StyleBoxFlat.new()
+	style.bg_color = Color(0.08, 0.10, 0.15, 0.98)
+	style.border_color = Color(0.3, 0.6, 1.0, 0.85)
+	style.border_width_left = 2
+	style.border_width_top = 2
+	style.border_width_right = 2
+	style.border_width_bottom = 2
+	style.corner_radius_top_left = 8
+	style.corner_radius_top_right = 8
+	style.corner_radius_bottom_left = 8
+	style.corner_radius_bottom_right = 8
+	experiment_dialog.add_theme_stylebox_override("panel", style)
+
+	var margin: MarginContainer = MarginContainer.new()
+	margin.add_theme_constant_override("margin_left", 14)
+	margin.add_theme_constant_override("margin_top", 12)
+	margin.add_theme_constant_override("margin_right", 14)
+	margin.add_theme_constant_override("margin_bottom", 12)
+	experiment_dialog.add_child(margin)
+
+	var vbox: VBoxContainer = VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", 10)
+	margin.add_child(vbox)
+
+	# Encabezado
+	var header_hbox: HBoxContainer = HBoxContainer.new()
+	vbox.add_child(header_hbox)
+
+	var title_lbl: Label = Label.new()
+	title_lbl.text = "🎓 Gestor de Experimentos (Exportar / Importar JSON)"
+	title_lbl.add_theme_font_size_override("font_size", 16)
+	title_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	header_hbox.add_child(title_lbl)
+
+	var close_btn: Button = Button.new()
+	close_btn.text = " ✕ "
+	close_btn.custom_minimum_size = Vector2(44.0, 38.0)
+	close_btn.focus_mode = Control.FOCUS_NONE
+	close_btn.pressed.connect(func(): _toggle_experiment_dialog(false))
+	header_hbox.add_child(close_btn)
+
+	var desc_lbl: Label = Label.new()
+	desc_lbl.text = "Herramienta académica para docentes y estudiantes: comparte simulaciones por WhatsApp, Teams o archivos."
+	desc_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	desc_lbl.add_theme_font_size_override("font_size", 13)
+	desc_lbl.modulate = Color(0.85, 0.9, 1.0, 0.85)
+	vbox.add_child(desc_lbl)
+
+	# Columnas: Izquierda = Exportar, Derecha = Importar
+	var columns_hbox: HBoxContainer = HBoxContainer.new()
+	columns_hbox.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	columns_hbox.add_theme_constant_override("separation", 14)
+	vbox.add_child(columns_hbox)
+
+	# --- Columna Exportar ---
+	var exp_vbox: VBoxContainer = VBoxContainer.new()
+	exp_vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	exp_vbox.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	columns_hbox.add_child(exp_vbox)
+
+	var exp_title: Label = Label.new()
+	exp_title.text = "📤 Exportar Escenario Actual"
+	exp_title.add_theme_font_size_override("font_size", 14)
+	exp_vbox.add_child(exp_title)
+
+	export_json_text = TextEdit.new()
+	export_json_text.editable = false
+	export_json_text.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	export_json_text.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+	exp_vbox.add_child(export_json_text)
+
+	var exp_btn_row: HBoxContainer = HBoxContainer.new()
+	exp_btn_row.add_theme_constant_override("separation", 8)
+	exp_vbox.add_child(exp_btn_row)
+
+	var copy_btn: Button = Button.new()
+	copy_btn.text = "📋 Copiar JSON"
+	copy_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	copy_btn.custom_minimum_size = Vector2(0.0, TOUCH_BUTTON_HEIGHT)
+	copy_btn.focus_mode = Control.FOCUS_NONE
+	copy_btn.pressed.connect(_on_copy_export_json_pressed)
+	exp_btn_row.add_child(copy_btn)
+
+	var save_btn: Button = Button.new()
+	save_btn.text = "💾 Guardar Archivo"
+	save_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	save_btn.custom_minimum_size = Vector2(0.0, TOUCH_BUTTON_HEIGHT)
+	save_btn.focus_mode = Control.FOCUS_NONE
+	save_btn.pressed.connect(_on_save_button_pressed)
+	exp_btn_row.add_child(save_btn)
+
+	# --- Columna Importar ---
+	var imp_vbox: VBoxContainer = VBoxContainer.new()
+	imp_vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	imp_vbox.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	columns_hbox.add_child(imp_vbox)
+
+	var imp_title: Label = Label.new()
+	imp_title.text = "📥 Importar / Cargar Escenario"
+	imp_title.add_theme_font_size_override("font_size", 14)
+	imp_vbox.add_child(imp_title)
+
+	import_json_text = TextEdit.new()
+	import_json_text.placeholder_text = "Pega aquí el código JSON enviado por el profesor o compañero..."
+	import_json_text.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	import_json_text.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+	imp_vbox.add_child(import_json_text)
+
+	var imp_btn_row: HBoxContainer = HBoxContainer.new()
+	imp_btn_row.add_theme_constant_override("separation", 8)
+	imp_vbox.add_child(imp_btn_row)
+
+	var paste_btn: Button = Button.new()
+	paste_btn.text = "📋 Pegar Portapapeles"
+	paste_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	paste_btn.custom_minimum_size = Vector2(0.0, TOUCH_BUTTON_HEIGHT)
+	paste_btn.focus_mode = Control.FOCUS_NONE
+	paste_btn.pressed.connect(_on_paste_import_json_pressed)
+	imp_btn_row.add_child(paste_btn)
+
+	var open_btn: Button = Button.new()
+	open_btn.text = "📂 Cargar Archivo"
+	open_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	open_btn.custom_minimum_size = Vector2(0.0, TOUCH_BUTTON_HEIGHT)
+	open_btn.focus_mode = Control.FOCUS_NONE
+	open_btn.pressed.connect(_on_load_button_pressed)
+	imp_btn_row.add_child(open_btn)
+
+	var apply_btn: Button = Button.new()
+	apply_btn.text = "🚀 Cargar Escenario en Simulador"
+	apply_btn.custom_minimum_size = Vector2(0.0, TOUCH_BUTTON_HEIGHT)
+	apply_btn.focus_mode = Control.FOCUS_NONE
+	apply_btn.pressed.connect(_apply_imported_json)
+	imp_vbox.add_child(apply_btn)
+
+	# Pie de página / Estado
+	import_status_label = Label.new()
+	import_status_label.text = "Listo para exportar o importar simulaciones."
+	import_status_label.add_theme_font_size_override("font_size", 13)
+	import_status_label.modulate = Color(0.5, 0.85, 1.0)
+	vbox.add_child(import_status_label)
+
+	$UI.add_child(experiment_dialog)
+	_layout_experiment_dialog()
+
+func _layout_experiment_dialog() -> void:
+	if experiment_dialog == null:
+		return
+	var vp_size: Vector2 = _view_size()
+	var panel_w: float = clampf(vp_size.x - 40.0, 520.0, 880.0)
+	var panel_h: float = clampf(vp_size.y - TOP_BAR_HEIGHT - 40.0, 420.0, 680.0)
+	experiment_dialog.size = Vector2(panel_w, panel_h)
+	experiment_dialog.position = Vector2(
+		maxf(10.0, (vp_size.x - panel_w) / 2.0),
+		maxf(TOP_BAR_HEIGHT + 10.0, (vp_size.y - panel_h) / 2.0)
+	)
+
+func _toggle_experiment_dialog(force_state = null) -> void:
+	if experiment_dialog == null:
+		return
+	var next_state: bool = (not experiment_dialog.visible) if (force_state == null) else bool(force_state)
+	experiment_dialog.visible = next_state
+	if next_state:
+		if export_json_text != null:
+			export_json_text.text = get_simulation_json_string()
+		if import_status_label != null:
+			import_status_label.text = "Listo para exportar o importar simulaciones."
+			import_status_label.modulate = Color(0.5, 0.85, 1.0)
+		_layout_experiment_dialog()
+
+func _on_copy_export_json_pressed() -> void:
+	if export_json_text != null:
+		DisplayServer.clipboard_set(export_json_text.text)
+		if import_status_label != null:
+			import_status_label.text = "✅ JSON copiado al portapapeles. Listo para enviar por chat/correo."
+			import_status_label.modulate = Color(0.4, 1.0, 0.5)
+
+func _on_paste_import_json_pressed() -> void:
+	var clip_text: String = DisplayServer.clipboard_get().strip_edges()
+	if clip_text.is_empty():
+		if import_status_label != null:
+			import_status_label.text = "⚠️ El portapapeles está vacío o no contiene texto."
+			import_status_label.modulate = Color.YELLOW
+		return
+	if import_json_text != null:
+		import_json_text.text = clip_text
+		if import_status_label != null:
+			import_status_label.text = "📋 Texto pegado desde el portapapeles. Presiona 'Cargar Escenario'."
+			import_status_label.modulate = Color(0.4, 0.85, 1.0)
+
+func _apply_imported_json() -> void:
+	if import_json_text == null:
+		return
+	var text: String = import_json_text.text.strip_edges()
+	if text.is_empty():
+		if import_status_label != null:
+			import_status_label.text = "⚠️ Por favor ingresa o pega el JSON primero."
+			import_status_label.modulate = Color.YELLOW
+		return
+	var res: Dictionary = load_from_json_string(text)
+	if res.get("success", false):
+		if import_status_label != null:
+			import_status_label.text = "✅ " + res.get("message", "Simulación cargada exitosamente.")
+			import_status_label.modulate = Color(0.4, 1.0, 0.5)
+	else:
+		if import_status_label != null:
+			import_status_label.text = "❌ " + res.get("error", "Error al procesar el JSON.")
+			import_status_label.modulate = Color(1.0, 0.4, 0.4)
+
+func _configure_file_dialog(fd: FileDialog) -> void:
+	if fd == null:
+		return
+	var favs: PackedStringArray = []
+	var docs: String = OS.get_system_dir(OS.SYSTEM_DIR_DOCUMENTS)
+	var downs: String = OS.get_system_dir(OS.SYSTEM_DIR_DOWNLOADS)
+	var desk: String = OS.get_system_dir(OS.SYSTEM_DIR_DESKTOP)
+	var user_data: String = OS.get_user_data_dir()
+
+	# Agregar carpetas conocidas a Favoritos
+	if not downs.is_empty() and DirAccess.dir_exists_absolute(downs) and not favs.has(downs):
+		favs.append(downs)
+	if not docs.is_empty() and DirAccess.dir_exists_absolute(docs) and not favs.has(docs):
+		favs.append(docs)
+	if not desk.is_empty() and DirAccess.dir_exists_absolute(desk) and not favs.has(desk):
+		favs.append(desk)
+	if not user_data.is_empty() and DirAccess.dir_exists_absolute(user_data) and not favs.has(user_data):
+		favs.append(user_data)
+
+	# Rutas comunes en Android / móvil
+	if OS.get_name() == "Android":
+		var android_storage: String = "/storage/emulated/0/Download"
+		if DirAccess.dir_exists_absolute(android_storage) and not favs.has(android_storage):
+			favs.append(android_storage)
+		var android_docs: String = "/storage/emulated/0/Documents"
+		if DirAccess.dir_exists_absolute(android_docs) and not favs.has(android_docs):
+			favs.append(android_docs)
+
+	fd.set_favorite_list(favs)
+
+	# Carpeta predeterminada: preferir Documentos o Descargas
+	var target_dir: String = ""
+	if not docs.is_empty() and DirAccess.dir_exists_absolute(docs):
+		target_dir = docs
+	elif not downs.is_empty() and DirAccess.dir_exists_absolute(downs):
+		target_dir = downs
+	elif not favs.is_empty():
+		target_dir = favs[0]
+	else:
+		target_dir = user_data
+
+	fd.current_dir = target_dir
+
+func _setup_file_dialogs() -> void:
+	save_file_dialog = FileDialog.new()
+	save_file_dialog.file_mode = FileDialog.FILE_MODE_SAVE_FILE
+	save_file_dialog.access = FileDialog.ACCESS_FILESYSTEM
+	save_file_dialog.filters = PackedStringArray(["*.json ; Archivos de Simulación JSON"])
+	save_file_dialog.file_selected.connect(_on_save_file_selected)
+	_configure_file_dialog(save_file_dialog)
+	$UI.add_child(save_file_dialog)
+
+	load_file_dialog = FileDialog.new()
+	load_file_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+	load_file_dialog.access = FileDialog.ACCESS_FILESYSTEM
+	load_file_dialog.filters = PackedStringArray(["*.json ; Archivos de Simulación JSON"])
+	load_file_dialog.file_selected.connect(_on_load_file_selected)
+	_configure_file_dialog(load_file_dialog)
+	$UI.add_child(load_file_dialog)
+
+func _on_save_button_pressed() -> void:
+	if save_file_dialog != null:
+		_configure_file_dialog(save_file_dialog)
+		save_file_dialog.popup_centered(Vector2i(700, 520))
+	else:
+		save_to_json()
+
+func _on_load_button_pressed() -> void:
+	if load_file_dialog != null:
+		_configure_file_dialog(load_file_dialog)
+		load_file_dialog.popup_centered(Vector2i(700, 520))
+	else:
+		load_from_json()
+
+func _on_save_file_selected(path: String) -> void:
+	var ok: bool = save_to_json(path)
+	if import_status_label != null:
+		import_status_label.text = ("✅ Archivo guardado con éxito: %s" % path.get_file()) if ok else "❌ Error al guardar archivo."
+		import_status_label.modulate = Color(0.4, 1.0, 0.5) if ok else Color(1.0, 0.4, 0.4)
+
+func _on_load_file_selected(path: String) -> void:
+	var ok: bool = load_from_json(path)
+	if import_status_label != null:
+		import_status_label.text = ("✅ Archivo cargado con éxito: %s" % path.get_file()) if ok else "❌ Error al cargar archivo."
+		import_status_label.modulate = Color(0.4, 1.0, 0.5) if ok else Color(1.0, 0.4, 0.4)
+
+# ---------- Guardar / Cargar JSON y Experimentos Predefinidos ----------
+
+## Genera el texto JSON completo con todo el estado del escenario.
+func get_simulation_json_string() -> String:
+	var data: Dictionary = {
+		"version": 1,
+		"camera_center": [camera_center.x, camera_center.y],
+		"pixels_per_meter": pixels_per_meter,
+		"layer": layer,
+		"charges": [],
+		"shape_groups": [],
+		"conductors": [],
+		"rigid_objects": [],
+		"wires": [],
+		"compasses": []
+	}
+
+	var charge_to_idx: Dictionary = {}
+	for i in range(charges.size()):
+		var c: Charge = charges[i]
+		charge_to_idx[c] = i
+		data["charges"].append({
+			"x": c.position.x,
+			"y": c.position.y,
+			"q": c.q
+		})
+
+	for g in shape_groups:
+		var indices: Array = []
+		for p in g.get("points", []):
+			if charge_to_idx.has(p):
+				indices.append(charge_to_idx[p])
+		data["shape_groups"].append({
+			"closed": g.get("closed", false),
+			"type": g.get("type", ""),
+			"radius": g.get("radius", 0.0),
+			"center": [g.get("center", Vector2.ZERO).x, g.get("center", Vector2.ZERO).y],
+			"indices": indices
+		})
+
+	for cond in conductors:
+		if cond is ConductorPlane:
+			data["conductors"].append({
+				"kind": "plane",
+				"point": [cond.point.x, cond.point.y],
+				"normal": [cond.normal.x, cond.normal.y]
+			})
+		elif cond is ConductorSphere:
+			data["conductors"].append({
+				"kind": "sphere",
+				"center": [cond.center.x, cond.center.y],
+				"radius": cond.radius
+			})
+
+	for obj in rigid_objects:
+		data["rigid_objects"].append({
+			"x": obj.position.x,
+			"y": obj.position.y,
+			"rotation": obj.rotation,
+			"label": obj.label
+		})
+
+	for item in magnetics:
+		if item is CurrentWire:
+			data["wires"].append({
+				"x": item.position.x,
+				"y": item.position.y,
+				"current": item.current
+			})
+		elif item is MagneticCompass:
+			data["compasses"].append({
+				"x": item.position.x,
+				"y": item.position.y
+			})
+
+	return JSON.stringify(data, "  ")
+
+## Carga un escenario a partir de un texto JSON. Devuelve un Dictionary con el resultado.
+func load_from_json_string(text: String) -> Dictionary:
+	var json: JSON = JSON.new()
+	var err = json.parse(text)
+	if err != OK:
+		return {"success": false, "error": "Error al parsear JSON: %s (línea %d)" % [json.get_error_message(), json.get_error_line()]}
+
+	if not (json.data is Dictionary):
+		return {"success": false, "error": "El JSON debe contener un objeto raíz {}"}
+
+	var data: Dictionary = json.data
+	clear_all()
+
+	if data.has("camera_center") and data["camera_center"] is Array and data["camera_center"].size() >= 2:
+		camera_center = Vector2(float(data["camera_center"][0]), float(data["camera_center"][1]))
+	if data.has("pixels_per_meter"):
+		pixels_per_meter = float(data["pixels_per_meter"])
+	if data.has("layer"):
+		layer = int(data["layer"])
+		_update_layer_button()
+
+	var loaded_charges: Array = []
+	for cd in data.get("charges", []):
+		var c: Charge = Charge.new(Vector2(float(cd["x"]), float(cd["y"])), float(cd["q"]))
+		charges.append(c)
+		loaded_charges.append(c)
+
+	for gd in data.get("shape_groups", []):
+		var pts: Array = []
+		for idx in gd.get("indices", []):
+			var i_int: int = int(idx)
+			if i_int >= 0 and i_int < loaded_charges.size():
+				pts.append(loaded_charges[i_int])
+		var c_arr = gd.get("center", [0.0, 0.0])
+		var center_vec: Vector2 = Vector2(float(c_arr[0]), float(c_arr[1]))
+		_add_shape(pts, gd.get("closed", false), false, gd.get("type", ""), float(gd.get("radius", 0.0)), center_vec)
+
+	for cond in data.get("conductors", []):
+		if cond.get("kind") == "plane":
+			var pt = Vector2(float(cond["point"][0]), float(cond["point"][1]))
+			var nrm = Vector2(float(cond["normal"][0]), float(cond["normal"][1]))
+			_add_conductor(ConductorPlane.new(pt, nrm))
+		elif cond.get("kind") == "sphere":
+			var c = Vector2(float(cond["center"][0]), float(cond["center"][1]))
+			_add_conductor(ConductorSphere.new(c, float(cond["radius"])))
+
+	for rd in data.get("rigid_objects", []):
+		var obj: RigidObject = RigidObject.make_magnet(Vector2(float(rd["x"]), float(rd["y"])), MAGNET_LENGTH_M, MAGNET_POLE_AM, float(rd.get("rotation", 0.0)))
+		rigid_objects.append(obj)
+
+	for wd in data.get("wires", []):
+		var wire: CurrentWire = CurrentWire.new(Vector2(float(wd["x"]), float(wd["y"])), float(wd["current"]))
+		magnetics.append(wire)
+
+	for comp in data.get("compasses", []):
+		var compass: MagneticCompass = MagneticCompass.new(Vector2(float(comp["x"]), float(comp["y"])))
+		magnetics.append(compass)
+
+	_recompute_field_lines()
+	grid_dirty = true
+	_refresh_selection_ui()
+	queue_redraw()
+
+	var summary: String = "Cargadas: %d cargas" % loaded_charges.size()
+	if not conductors.is_empty():
+		summary += ", %d conductor(es)" % conductors.size()
+	if not rigid_objects.is_empty():
+		summary += ", %d imán(es)" % rigid_objects.size()
+	if not magnetics.is_empty():
+		summary += ", %d objeto(s) magnético(s)" % magnetics.size()
+	return {"success": true, "message": summary}
+
+## Guarda todo el estado del escenario en formato JSON en un archivo.
+func save_to_json(path: String = "user://simulation.json") -> bool:
+	var file: FileAccess = FileAccess.open(path, FileAccess.WRITE)
+	if file == null:
+		return false
+	file.store_string(get_simulation_json_string())
+	file.close()
+	print("Simulación guardada con éxito en: ", path)
+	return true
+
+## Carga un escenario previamente guardado en formato JSON desde un archivo.
+func load_from_json(path: String = "user://simulation.json") -> bool:
+	if not FileAccess.file_exists(path):
+		print("El archivo no existe: ", path)
+		return false
+
+	var file: FileAccess = FileAccess.open(path, FileAccess.READ)
+	if file == null:
+		return false
+	var text: String = file.get_as_text()
+	file.close()
+
+	var res: Dictionary = load_from_json_string(text)
+	return res.get("success", false)
+
+## Limpia todas las cargas, formas, conductores y objetos de la escena.
+func clear_all() -> void:
+	_deselect()
+	charges.clear()
+	shape_groups.clear()
+	charge_group.clear()
+	conductors.clear()
+	rigid_objects.clear()
+	magnetics.clear()
+	selected_rigid = null
+	selected_conductor = null
+	selected_mag = null
+	_recompute_field_lines()
+	grid_dirty = true
+	_refresh_selection_ui()
+	queue_redraw()
+
+## Carga experimentos físicos predefinidos listos para demostración.
+func load_experiment(name: String) -> void:
+	clear_all()
+	camera_center = Vector2.ZERO
+	pixels_per_meter = DEFAULT_PIXELS_PER_METER
+	layer = Layer.ELECTRIC
+
+	match name:
+		"dipole":
+			# 1. Dipolo eléctrico (±1 µC a 4 m)
+			var q1: Charge = Charge.new(Vector2(-2.0, 0.0), PhysicsConstants.MICRO)
+			var q2: Charge = Charge.new(Vector2(2.0, 0.0), -PhysicsConstants.MICRO)
+			charges.append(q1)
+			charges.append(q2)
+			_set_selection([q1])
+
+		"equal_charges":
+			# 2. Dos cargas iguales (+1 µC a 4 m)
+			var q1: Charge = Charge.new(Vector2(-2.0, 0.0), PhysicsConstants.MICRO)
+			var q2: Charge = Charge.new(Vector2(2.0, 0.0), PhysicsConstants.MICRO)
+			charges.append(q1)
+			charges.append(q2)
+			_set_selection([q1])
+
+		"faraday":
+			# 3. Jaula de Faraday: anillo de radio 1.5 m con +8 µC, y carga de prueba en el centro con E=0
+			var ring_pts: Array = ChargedShapes.make_ring(Vector2.ZERO, 1.5, 8.0 * PhysicsConstants.MICRO, SHAPE_POINTS)
+			_add_shape(ring_pts, true, false, "ring", 1.5, Vector2.ZERO)
+			var test_q: Charge = Charge.new(Vector2.ZERO, 0.1 * PhysicsConstants.MICRO)
+			charges.append(test_q)
+			_set_selection([test_q])
+
+		"plane_ground":
+			# 4. Plano a tierra y carga de +2 µC
+			_add_conductor(ConductorPlane.new(Vector2.ZERO, Vector2.RIGHT))
+			var q: Charge = Charge.new(Vector2(2.0, 0.0), 2.0 * PhysicsConstants.MICRO)
+			charges.append(q)
+			_set_selection([q])
+
+		"parallel_plates":
+			# 5. Varillas paralelas (+/-)
+			var plates: Array = ChargedShapes.make_rod_pair(Vector2.ZERO, SHAPE_LENGTH_M, PAIR_SEPARATION_M, 0.0, 4.0 * PhysicsConstants.MICRO, SHAPE_POINTS)
+			_add_shape(plates, false, true, "rod_pair", 0.0, Vector2.ZERO)
+
+		"wire_compasses":
+			# 6. Hilo con corriente y brújulas alrededor
+			layer = Layer.MAGNETIC
+			var wire: CurrentWire = CurrentWire.new(Vector2.ZERO, WIRE_CURRENT_A)
+			magnetics.append(wire)
+			for i in range(4):
+				var angle: float = TAU * float(i) / 4.0
+				var pos: Vector2 = Vector2(cos(angle), sin(angle)) * 1.2
+				magnetics.append(MagneticCompass.new(pos))
+			_select_mag(wire)
+
+	_update_layer_button()
+	_recompute_field_lines()
+	grid_dirty = true
+	_refresh_selection_ui()
+	queue_redraw()
